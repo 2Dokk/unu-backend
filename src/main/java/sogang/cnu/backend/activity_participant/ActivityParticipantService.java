@@ -11,6 +11,7 @@ import sogang.cnu.backend.activity_participant.dto.ActivityParticipantRefundAcco
 import sogang.cnu.backend.activity_participant.dto.ActivityParticipantResponseDto;
 import sogang.cnu.backend.activity_participant.dto.ActivityParticipantSummaryDto;
 import sogang.cnu.backend.activity_participant.dto.ActivityCapacityResponseDto;
+import sogang.cnu.backend.activity.dto.ActivityResponseDto;
 import sogang.cnu.backend.attendance.AttendanceRepository;
 import sogang.cnu.backend.attendance_report.AttendanceReportRepository;
 import sogang.cnu.backend.budget.StudyDepositLedgerService;
@@ -42,6 +43,7 @@ public class ActivityParticipantService {
     private final AttendanceRepository attendanceRepository;
     private final AttendanceReportRepository attendanceReportRepository;
     private final StudyDepositLedgerService studyDepositLedgerService;
+    private final ActivityAccessGuard activityAccessGuard;
 
 
     @Transactional(readOnly = true)
@@ -50,13 +52,13 @@ public class ActivityParticipantService {
                 .orElseThrow(() -> new NotFoundException("ActivityParticipant not found"));
         requireOwnerOrManager(activity);
 
-        return activityParticipantMapper.toResponseDto(activity);
+        return toVisibleResponseDto(activity);
     }
 
     @Transactional(readOnly = true)
     public List<ActivityParticipantResponseDto> getAll() {
         return activityParticipantRepository.findAll().stream()
-                .map(activityParticipantMapper::toResponseDto)
+                .map(this::toVisibleResponseDto)
                 .collect(Collectors.toList());
     }
 
@@ -73,7 +75,7 @@ public class ActivityParticipantService {
         ActivityParticipant activityParticipant = ActivityParticipant.create(createCommand);
         activityParticipantRepository.save(activityParticipant);
         activateUserIfApproved(activityParticipant);
-        return activityParticipantMapper.toResponseDto(activityParticipant);
+        return toVisibleResponseDto(activityParticipant);
     }
 
     @Transactional
@@ -128,7 +130,7 @@ public class ActivityParticipantService {
                 existing.recordLectureParticipationMode(LectureParticipationMode.INDIVIDUAL);
             }
             activateUserIfApproved(existing);
-            return activityParticipantMapper.toResponseDto(existing);
+            return toVisibleResponseDto(existing);
         }
 
         validateAvailableCapacity(targetActivity, initialStatus);
@@ -153,7 +155,7 @@ public class ActivityParticipantService {
             studyDepositLedgerService.recordDeposit(activityParticipant);
         }
         activateUserIfApproved(activityParticipant);
-        return activityParticipantMapper.toResponseDto(activityParticipant);
+        return toVisibleResponseDto(activityParticipant);
     }
 
     @Transactional(readOnly = true)
@@ -161,9 +163,10 @@ public class ActivityParticipantService {
         Activity activity = findActivity(activityId);
         long participantCount = countCapacityParticipants(activity);
         Integer participantLimit = activity.getParticipantLimit();
+        boolean canViewExactCapacity = isLecture(activity) || activityAccessGuard.canManage(activity);
         return ActivityCapacityResponseDto.builder()
-                .participantLimit(participantLimit)
-                .participantCount(participantCount)
+                .participantLimit(canViewExactCapacity ? participantLimit : null)
+                .participantCount(canViewExactCapacity ? participantCount : null)
                 .full(participantLimit != null && participantCount >= participantLimit)
                 .build();
     }
@@ -224,7 +227,7 @@ public class ActivityParticipantService {
 
         ActivityParticipantStatus newStatus = ActivityParticipantStatus.valueOf(dto.getStatus());
         changeStatus(activity, newStatus);
-        return activityParticipantMapper.toResponseDto(activity);
+        return toVisibleResponseDto(activity);
     }
 
     @Transactional
@@ -246,7 +249,7 @@ public class ActivityParticipantService {
         if (newStatus == ActivityParticipantStatus.REJECTED) {
             activity.recordReviewMessage(reviewMessage);
         }
-        return activityParticipantMapper.toResponseDto(activity);
+        return toVisibleResponseDto(activity);
     }
 
     @Transactional
@@ -263,7 +266,7 @@ public class ActivityParticipantService {
             }
         }
         applyCompletedChange(activity, completed);
-        return activityParticipantMapper.toResponseDto(activity);
+        return toVisibleResponseDto(activity);
     }
 
     private void applyCompletedChange(ActivityParticipant participant, boolean completed) {
@@ -328,21 +331,18 @@ public class ActivityParticipantService {
         }
         List<ActivityParticipant> participants = activityParticipantRepository.findByActivityId(activityId);
         return participants.stream()
-                .map(activityParticipantMapper::toResponseDto)
+                .map(this::toVisibleResponseDto)
                 .collect(Collectors.toList());
     }
 
     @Transactional(readOnly = true)
     public List<ActivityParticipantSummaryDto> getVisibleMembers(UUID activityId) {
         Activity activity = findActivity(activityId);
-        boolean managerOrAdmin = SecurityUtils.isManagerOrAdmin();
-        boolean assignee = activity.getAssignee() != null
-                && activity.getAssignee().getId().equals(SecurityUtils.getCurrentUserId());
         boolean recruitmentClosed = activity.getStatus() == ActivityStatus.ONGOING
                 || activity.getStatus() == ActivityStatus.COMPLETED;
-
-        if (!recruitmentClosed && !assignee && !managerOrAdmin) {
-            throw new ForbiddenException("모집 마감 후 참여자 명단을 확인할 수 있습니다.");
+        if (!activityAccessGuard.canManage(activity)
+                && (!recruitmentClosed || !activityAccessGuard.canView(activity))) {
+            throw new ForbiddenException("모집 마감 후 해당 활동의 참여자만 참여자 명단을 확인할 수 있습니다.");
         }
 
         return activityParticipantRepository.findByActivityId(activityId).stream()
@@ -358,14 +358,32 @@ public class ActivityParticipantService {
 
     public ActivityParticipantResponseDto getByUserIdAndActivityId(UUID userId, UUID activityId) {
         ActivityParticipant participant = activityParticipantRepository.findByUserIdAndActivityId(userId, activityId).orElse(null);
-        return activityParticipantMapper.toResponseDto(participant);
+        return toVisibleResponseDto(participant);
     }
 
     public List<ActivityParticipantResponseDto> getByUserId(UUID userId) {
         List<ActivityParticipant> participants = activityParticipantRepository.findByUserId(userId);
         return participants.stream()
-                .map(activityParticipantMapper::toResponseDto)
+                .map(this::toVisibleResponseDto)
                 .collect(Collectors.toList());
+    }
+
+    private ActivityParticipantResponseDto toVisibleResponseDto(ActivityParticipant participant) {
+        ActivityParticipantResponseDto response = activityParticipantMapper.toResponseDto(participant);
+        if (response == null || activityAccessGuard.canView(participant.getActivity())) {
+            return response;
+        }
+
+        ActivityResponseDto activity = response.getActivity();
+        if (activity != null) {
+            activity.setDiscordUrl(null);
+            activity.setCreatedBy(null);
+            activity.setModifiedBy(null);
+            if (!isLecture(participant.getActivity())) {
+                activity.setParticipantLimit(null);
+            }
+        }
+        return response;
     }
 
     private boolean isRecruitmentOpen(Activity activity) {
